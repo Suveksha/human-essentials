@@ -65,6 +65,10 @@ RSpec.describe "Dashboard", type: :system, js: true, skip_seed: true do
   end
 
   context "With an existing Diaper bank" do
+    date_to_view = Time.zone.now
+    # let(:last_year_date) { Time.zone.now - 1.year }
+    # let(:beginning_of_year) { Time.zone.now.beginning_of_year }
+
     before do
       sign_in(@user)
     end
@@ -91,10 +95,6 @@ RSpec.describe "Dashboard", type: :system, js: true, skip_seed: true do
     end
 
     describe "Inventory Totals" do
-      let(:date_to_view) { Time.zone.now }
-      let(:last_year_date) { Time.zone.now - 1.year }
-      let(:beginning_of_year) { Time.zone.now.beginning_of_year }
-
       describe "Summary" do
         before do
           create_list(:storage_location, 3, :with_items, item_quantity: 111, organization: @organization)
@@ -115,12 +115,6 @@ RSpec.describe "Dashboard", type: :system, js: true, skip_seed: true do
       end
 
       describe "Donations" do
-        around do |example|
-          travel_to(date_to_view)
-          example.run
-          travel_back
-        end
-
         it "has a link to create a new donation" do
           org_new_donation_page = OrganizationNewDonationPage.new org_short_name: org_short_name
 
@@ -146,127 +140,98 @@ RSpec.describe "Dashboard", type: :system, js: true, skip_seed: true do
         #   end
         # end
 
-        context "when constrained to date range" do
-          before do
-            @organization.donations.destroy_all
-            @this_years_donations = {
-              today: create(:donation, :with_items, issued_at: date_to_view, item_quantity: 100, storage_location: storage_location, organization: @organization),
-              yesterday: create(:diaper_drive_donation, :with_items, issued_at: date_to_view.yesterday, item_quantity: 101, storage_location: storage_location, organization: @organization),
-              earlier_this_week: create(:donation_site_donation, :with_items, issued_at: date_to_view.beginning_of_week, item_quantity: 102, storage_location: storage_location, organization: @organization),
-              beginning_of_year: create(:manufacturer_donation, :with_items, issued_at: beginning_of_year, item_quantity: 103, storage_location: storage_location, organization: @organization)
-            }
-            @last_years_donations = create_list(:donation, 2, :with_items, issued_at: last_year_date, item_quantity: 104, storage_location: storage_location, organization: @organization)
-            org_dashboard_page.visit
-          end
+        # 1, 20, 300, ..., 900000000
+        # assuming each value is used once, summing these values makes easily recognizable totals
+        # .fetch() from it so too-high indices raise IndexError
+        # legal indices are in -8..8 (i.e., inclusive)
+        item_quantities = (1..9).map { |i| i * 10**(i-1) }
 
-          describe "This Year" do
+        # as of 28 Jan 2022, the "Recent Donations" list shows up to this many items matching the date filter
+        max_recent_donation_links_count = 3
+
+        # Make up to this many (inclusive) donations for each filtered period
+        # Keep it below (item_quantities.size - 1) so there's at least one value left for
+        # a donation outside of the filtered period
+        max_donations_in_filtered_period = max_recent_donation_links_count + 1
+
+        around do |example|
+          travel_to(date_to_view)
+          example.run
+          travel_back
+        end
+
+        [
+          ["Today",        date_to_view,                               date_to_view],
+          ["Yesterday",    date_to_view.yesterday,                     date_to_view.yesterday],
+          ["Last 7 Days",  date_to_view -  6.days,                     date_to_view],
+          ["Last 30 Days", date_to_view - 29.days,                     date_to_view],
+          ["This Month",   date_to_view.beginning_of_month,            date_to_view],
+          ["Last Month",   date_to_view.last_month.beginning_of_month, date_to_view.last_month.end_of_month],
+          ["This Year",    date_to_view.beginning_of_year,             date_to_view]
+        ].each do |date_range_info|
+          filtered_date_range_label, start_date, end_date = date_range_info
+
+          filtered_date_range = start_date.to_date..end_date.to_date
+          before_filtered_date_range = (start_date - 1.day).to_date
+
+          # Ideally different date ranges get different counts (incl. 0!) to test the various combinations
+          # w/out making a fixed pattern
+          num_donations_in_filtered_period = rand(0..max_donations_in_filtered_period)
+
+          context "given 1 Donation on #{before_filtered_date_range} and #{num_donations_in_filtered_period} during #{filtered_date_range}", :focus do
             before do
-              org_dashboard_page.filter_to_date_range "This Year"
+              @organization.donations.destroy_all
+              
+              filtered_dates = filtered_date_range.to_a
+              @expected_quantities_donated_in_filtered_date_range = []
+
+              # days_this_year.sample in num_donations_in_filtered_period.times loop
+              # rather than
+              # days_this_year.sample(num_donations_in_filtered_period).each
+              # because Array#sample(n) on an Array with m<n elements returns only m elements
+              num_donations_in_filtered_period.times do |num|
+                # use Array#fetch so it raises IndexError if needed
+                quantity_in_donation = item_quantities.fetch(num)
+
+                create :donation, :with_items, issued_at: filtered_dates.sample, item_quantity: quantity_in_donation, storage_location: storage_location, organization: @organization
+
+                @expected_quantities_donated_in_filtered_date_range << quantity_in_donation
+              end
+
+              # create a donation of the *next* amount *before* the filtered date range
+              quantity_in_donation = item_quantities.fetch(num_donations_in_filtered_period)
+              create :donation, :with_items, issued_at: before_filtered_date_range, item_quantity: quantity_in_donation, storage_location: storage_location, organization: @organization
             end
+    
+            describe "filtering to '#{filtered_date_range_label}'" do
+              before do
+                org_dashboard_page.visit
+                org_dashboard_page.filter_to_date_range filtered_date_range_label
+              end
 
-            let(:total_inventory) { @this_years_donations.values.map(&:total_quantity).sum }
+              expected_recent_donation_links_count = [max_recent_donation_links_count, num_donations_in_filtered_period].min
 
-            it "has a widget displaying the year-to-date Donation totals, only using donations from this year" do
-              expect(org_dashboard_page.total_donations).to eq total_inventory
-            end
+              it "shows the correct total and #{expected_recent_donation_links_count} Recent Donation link(s)" do
+                expect(org_dashboard_page.total_donations).to eq @expected_quantities_donated_in_filtered_date_range.sum
 
-            it "displays some recent donations" do
-              expect(org_dashboard_page.recent_donation_links)
-                .to include(match /10\d items/i) # e.g., "101 items", "103 items", etc.
-                .exactly(3).times
-            end
-          end
+                recent_donation_links = org_dashboard_page.recent_donation_links
 
-          describe "Today" do
-            before do
-              org_dashboard_page.filter_to_date_range "Today"
-            end
+                expect(recent_donation_links.count).to eq expected_recent_donation_links_count
 
-            let(:total_inventory) { @this_years_donations[:today].total_quantity }
+                # Expect the links to be something like "1 item...", "20 items from Manufacturer"
+                # Strip out the item counts
+                recent_quantities = recent_donation_links.map { _1.match(/^\d+/).to_s.to_i }
 
-            it "has a widget displaying today's Donation totals, only using donations from today" do
-              expect(org_dashboard_page.total_donations).to eq total_inventory
-            end
-
-            it "displays some recent donations" do
-              expect(org_dashboard_page.recent_donation_links)
-                .to include(match /#{total_inventory} items/i) # e.g., "100 items"
-                .exactly(:once)
-            end
-          end
-
-          describe "Yesterday" do
-            before do
-              org_dashboard_page.filter_to_date_range "Yesterday"
-            end
-
-            let(:total_inventory) { @this_years_donations[:yesterday].total_quantity }
-
-            it "has a widget displaying the Donation totals from yesterday, only using donations from yesterday" do
-              expect(org_dashboard_page.total_donations).to eq total_inventory
-            end
-
-            it "displays some recent donations" do
-              expect(org_dashboard_page.recent_donation_links)
-                .to include(match /#{total_inventory} items/i) # e.g., "101 items"
-                .exactly(:once)
-            end
-          end
-
-          describe "This Week" do
-            before do
-              org_dashboard_page.filter_to_date_range "Last 7 Days"
-            end
-
-            let(:total_inventory) { [@this_years_donations[:today], @this_years_donations[:yesterday], @this_years_donations[:earlier_this_week]].map(&:total_quantity).sum }
-
-            it "has a widget displaying the Donation totals from this week, only using donations from this week" do
-              expect(org_dashboard_page.total_donations).to eq total_inventory
-            end
-
-            it "displays some recent donations" do
-              expect(org_dashboard_page.recent_donation_links)
-                .to include(match /10\d items/i) # e.g., "101 items", "103 items", etc.
-                .exactly(3).times
-            end
-          end
-
-          describe "This Month" do
-            before do
-              org_dashboard_page.filter_to_date_range "This Month"
-            end
-
-            let(:total_inventory) { %i[today yesterday earlier_this_week].map { |date| @this_years_donations[date].total_quantity }.sum }
-
-            it "has a widget displaying the Donation totals from this month, only using donations from this month" do
-              expect(org_dashboard_page.total_donations).to eq total_inventory
-            end
-
-            it "displays some recent donations" do
-              expect(org_dashboard_page.recent_donation_links)
-                .to include(match /10\d items/i) # e.g., "101 items", "103 items", etc.
-                .exactly(3).times
-            end
-          end
-
-          describe "All Time" do
-            before do
-              org_dashboard_page.filter_to_date_range "All Time"
-            end
-
-            let(:total_inventory) { @this_years_donations.values.map(&:total_quantity).sum + @last_years_donations.map(&:total_quantity).sum }
-
-            it "has a widget displaying the Donation totals from last year, only using donations from last year" do
-              expect(org_dashboard_page.total_donations).to eq total_inventory
-            end
-
-            it "displays some recent donations from that time" do
-              expect(org_dashboard_page.recent_donation_links)
-                .to include(match /10\d items/i) # e.g., "101 items", "103 items", etc.
-                .exactly(3).times
+                # By design, there might be more Donations during the period than Recent Donation links
+                # Make sure each Recent Donation link uniquely matches a single Donation
+                expect(@expected_quantities_donated_in_filtered_date_range.intersection recent_quantities).to match_array recent_quantities
+              end
             end
           end
         end
+
+        # TODO: "All Time"
+        # TODO: "Custom Range"?
       end
 
       describe "Purchases" do
